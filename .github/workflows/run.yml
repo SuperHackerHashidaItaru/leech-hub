@@ -39,10 +39,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: FedericoCarboni/setup-ffmpeg@v3
-        id: setup-ffmpeg
-        with:
-          ffmpeg-version: 'release'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
       - run: ffmpeg -v
       - run: pip install -r requirements.txt
       - run: python runner.py
