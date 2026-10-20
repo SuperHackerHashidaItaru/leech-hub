@@ -403,23 +403,18 @@ async def lyrics_get(artist: str, track: str, album: Optional[str] = None,
         if isinstance(exact, dict):
             best = _lyrics_record(exact)
         if best is None:
-            # fuzzy fallback: filtered search, best-scoring sane match
+            # v3: no validation - first search hit wins, the user picks
+            # with index= on the cog side. exact /api/get above already
+            # returned "the" match for these fields when lrclib has one.
             results = await _lrclib_get("/api/search", {
                 "artist_name": artist, "track_name": track,
             })
             candidates = [x for x in (results or []) if isinstance(x, dict)]
-            scored = []
-            for item in candidates:
-                ra = _ratio(artist, str(item.get("artistName") or ""))
-                rt = _ratio(track, str(item.get("trackName") or ""))
-                ral = _ratio(album or "", str(item.get("albumName") or "")) if album else 1.0
-                if ra >= 0.70 and rt >= 0.70 and ral >= 0.60:
-                    scored.append((ra + rt + ral, _lyrics_record(item)))
-            if scored:
-                best = max(scored, key=lambda pair: pair[0])[1]
+            if candidates:
+                best = _lyrics_record(candidates[0])
         if best is None:
-            return {"found": False, "reason": "no match passed the "
-                    "artist/track/album check", "prefer": prefer}
+            return {"found": False, "reason": "lrclib has nothing for that "
+                    "artist/track", "prefer": prefer}
         if best["instrumental"]:
             out = {**best, "found": True, "plain": None, "synced": None,
                    "chosen": "instrumental", "prefer": prefer}
@@ -586,7 +581,7 @@ class MonoSubmit(BaseModel):
 class ConvertSubmit(BaseModel):
     model_config = ConfigDict(extra="ignore")
     url: str
-    format: str = "mp3"
+    format: Optional[str] = None
     bitrate: Optional[int] = None
     res: Optional[int] = None
     crf: Optional[int] = None
@@ -790,17 +785,37 @@ async def api_jobs_create(body: JobIn, _=Depends(_authorized)):
     payload = body.payload or {}
     if kind == "yt":
         url = _check_url(str(payload.get("url") or ""))
-        fmt = (payload.get("format") or "").strip().lower()
-        if fmt and fmt not in AUDIO_FMTS:
-            raise HTTPException(400, f"yt format must be one of: {', '.join(AUDIO_FMTS)}")
-        bitrate = payload.get("bitrate")
-        if bitrate is not None and not (32 <= int(bitrate) <= 320):
-            raise HTTPException(400, "bitrate must be 32-320 kbps")
+        audio = bool(payload.get("audio"))
+        quality = payload.get("quality")
+        if quality is not None:
+            try:
+                quality = int(quality)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "quality must be a number (video height)")
+            if not 144 <= quality <= 2160:
+                raise HTTPException(400, "quality must be 144-2160")
+        max_mb = payload.get("max_mb")
+        if max_mb is not None:
+            try:
+                max_mb = float(max_mb)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "max_mb must be a number")
+            if not 1 <= max_mb <= 2000:
+                raise HTTPException(400, "max_mb must be 1-2000")
+        start, end = payload.get("start"), payload.get("end")
+        if start is not None or end is not None:
+            try:
+                start = float(start or 0)
+                end = float(end if end is not None else 0)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "clip start/end must be numbers")
+            if end <= start:
+                raise HTTPException(400, "clip end must be after start")
+        else:
+            start = end = None
         payload = {
-            "url": url,
-            "audio_only": bool(payload.get("audio_only", True)),
-            "format": fmt or None,
-            "bitrate": int(bitrate) if bitrate is not None else None,
+            "url": url, "audio": audio, "quality": quality,
+            "max_mb": max_mb, "start": start, "end": end,
         }
     job = await _submit(kind, payload)
     return {"ok": True, "job": job["id"]}

@@ -479,7 +479,6 @@ def _process_ffmpeg(job: dict, hub, work: Path, stage: Stage) -> dict:
 
 
 # ------------------------------------------------------------ yt job
-
 def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
     try:
         import yt_dlp
@@ -487,22 +486,28 @@ def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
         raise JobError("yt-dlp is not installed on this runner")
     p = job["payload"]
     url = str(p.get("url") or "")
-    audio_only = bool(p.get("audio_only", True))
-    fmt = (p.get("format") or "").strip().lower() or None
+    audio = bool(p.get("audio"))
+    quality = p.get("quality")
+    quality = int(quality) if isinstance(quality, int) and 144 <= quality <= 2160 else 720
+    max_mb = p.get("max_mb")
+    max_mb = float(max_mb) if isinstance(max_mb, (int, float)) and 1 <= float(max_mb) <= MAX_YT_MB else float(MAX_YT_MB)
+    start, end = p.get("start"), p.get("end")
+    clip = isinstance(start, (int, float)) and isinstance(end, (int, float)) and float(end) > float(start)
 
-    stage("probe", 0, 3, "")
+    stage("probe", 0, 4, "")
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
                                "noplaylist": True, "skip_download": True}) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception as exc:
-        raise JobError(f"yt-dlp couldn't read that link: {type(exc).__name__}")
+    except Exception:
+        raise JobError("yt-dlp couldn't read that link (private, dead, or unsupported)")
     duration = int(info.get("duration") or 0)
     if duration > 4 * 3600:
         raise JobError("that's over 4 hours - too long for this lane")
-    title = _sanitize(str(info.get("title") or "video"))
+    if clip:
+        duration = int(min(duration or 1e9, float(end) - float(start)))
 
-    stage("download", 1, 3, "")
+    stage("download", 1, 4, "")
     last_note: dict = {"t": 0.0}
 
     def hook(d: dict) -> None:
@@ -513,45 +518,66 @@ def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
             last_note["t"] = now
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes") or 0
-            stage("download", 1, 3,
+            stage("download", 1, 4,
                   f"{int(done * 100 / total)}%" if total else "downloading")
 
     opts: dict = {
         "outtmpl": str(work / "src.%(ext)s"),
         "noplaylist": True, "quiet": True, "no_warnings": True,
         "progress_hooks": [hook],
-        "max_filesize": MAX_YT_MB * 1024 * 1024,
+        "max_filesize": int(max_mb * 1024 * 1024),
     }
-    if audio_only:
+    if clip:
+        # yt-dlp downloads only the slice (needs a reencode-friendly cut,
+        # hence force_keyframes_at_cuts so the boundaries actually land)
+        opts["download_ranges"] = yt_dlp.utils.download_range_func(
+            None, float(start), float(end))
+        opts["force_keyframes_at_cuts"] = True
+    if audio:
         opts["format"] = "bestaudio/best"
+        opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+             "preferredquality": "192"},
+        ]
     else:
-        opts["format"] = "bestvideo*+bestaudio/best"
+        opts["format"] = f"bv*[height<={quality}]+ba/b[height<={quality}]"
         opts["merge_output_format"] = "mp4"
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     files = [f for f in work.iterdir() if f.name.startswith("src.")]
     if not files:
-        raise JobError("yt-dlp produced nothing (too big or unsupported)")
-    src = max(files, key=lambda f: f.stat().st_size)
+        raise JobError("yt-dlp produced nothing (over the size cap, private, or unsupported)")
+    final = max(files, key=lambda f: f.stat().st_size)
 
-    final = src
-    out_fmt = None
-    if fmt and fmt != "copy":
-        stage("convert", 2, 3, fmt)
-        final = work / f"out.{fmt}"
-        bitrate = p.get("bitrate")
-        run_ffmpeg(["-i", str(src), *AUDIO_CODEC[fmt](bitrate), str(final)])
-        out_fmt = fmt
-        src.unlink(missing_ok=True)
+    if final.stat().st_size > max_mb * 1024 * 1024:
+        if audio:
+            raise JobError(f"the audio is {final.stat().st_size / 1e6:.0f} mb - "
+                           f"over the {max_mb:.0f} mb cap")
+        stage("convert", 2, 4, "shrinking")
+        shrunk = work / "shrunk.mp4"
+        run_ffmpeg(["-i", str(final), "-vf", "scale=-2:480",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                    str(shrunk)])
+        if shrunk.stat().st_size > max_mb * 1024 * 1024:
+            raise JobError(f"still {shrunk.stat().st_size / 1e6:.0f} mb after one "
+                           f"shrink pass - try a lower quality or max_mb")
+        final.unlink(missing_ok=True)
+        final = shrunk
 
-    stage("upload", 3, 3, "")
+    stage("upload", 3, 4, "")
     cdn, host = upload_file(final)
     return {
         "kind": "yt", "url": cdn, "host": host, "filename": final.name,
-        "format": out_fmt or final.suffix.lstrip("."), "size": final.stat().st_size,
+        "format": final.suffix.lstrip(".") or ("mp3" if audio else "mp4"),
+        "size": final.stat().st_size,
+        "size_mb": round(final.stat().st_size / 1e6, 1),
         "duration": duration or None, "title": str(info.get("title") or None),
+        "webpage_url": str(info.get("webpage_url") or url),
+        "uploader": (info.get("uploader") or info.get("channel") or None),
+        "audio": audio or None,
+        "thumbnail": str(info.get("thumbnail") or None),
     }
-
 
 # ------------------------------------------------------------ dispatcher
 
