@@ -1,0 +1,43 @@
+name: leech-runner
+
+# the compute leg of the leech hub. this repo is PUBLIC on purpose:
+# standard github-hosted runners are FREE with no minute cap on public
+# repos (4 vCPU / 16GB ubuntu), while a private repo would burn the
+# 2000 free minutes fast. the code carries no secrets - hub url + token
+# live in repo secrets, and runner.py only ever prints job ids, sizes
+# and stages to these (public) logs - never urls, tokens or filenames.
+
+on:
+  repository_dispatch:            # the hub fires this on every job submit
+    types: [leech-job]
+  workflow_dispatch:              # manual: run a specific job id, or blank
+    inputs:                       # to scan the queue like the janitor does
+      job_id:
+        description: "job id to run (blank = scan the queue)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "*/15 * * * *"        # janitor: catches jobs whose dispatch failed
+
+concurrency:
+  group: leech-${{ github.event.client_payload.job_id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      HUB_URL: ${{ secrets.HUB_URL }}
+      TOKEN: ${{ secrets.LEECH_TOKEN }}
+      PIXELDRAIN_KEY: ${{ secrets.PIXELDRAIN_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python runner.py
