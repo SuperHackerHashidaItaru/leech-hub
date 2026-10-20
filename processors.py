@@ -29,6 +29,7 @@ from uploaders import upload_file
 
 MAX_TRACK_MB = 400
 MAX_ALBUM_MB = 2500
+LOOSE_FILES_CAP = 60       # v4: loose-file albums over this fall back to zip
 MAX_INPUT_MB = 1500
 MAX_YT_MB = 2000
 FFMPEG_TIMEOUT_S = 2400
@@ -347,7 +348,6 @@ def _mono_track(job: dict, hub, work: Path, stage: Stage) -> dict:
                 pass
     return result
 
-
 def _mono_album(job: dict, hub, work: Path, stage: Stage) -> dict:
     p = job["payload"]
     meta = p.get("meta") or {}
@@ -357,6 +357,7 @@ def _mono_album(job: dict, hub, work: Path, stage: Stage) -> dict:
     quality = str(p.get("quality") or "flac")
     codec, ext = _quality_profile(quality)
     lyrics_cfg = p.get("lyrics") or {"mode": "off", "prefer": "synced"}
+    zip_wanted = bool(p.get("zip", True))     # v4: False = loose files
 
     title = (meta.get("title") or "").strip() or f"album {p.get('release_id')}"
     artists = [str(a) for a in (meta.get("artists") or [])][:4]
@@ -372,17 +373,25 @@ def _mono_album(job: dict, hub, work: Path, stage: Stage) -> dict:
         (out_dir / "cover.png").write_bytes(cover)
     lyrics_found = 0
 
-    for index, track in enumerate(tracks):
-        stage("download", index, len(tracks), f"{index + 1}/{len(tracks)}")
-        raw = work / f"{index:02d}.flac"
-        fetch_to(str(track.get("url") or ""), raw, max_mb=MAX_TRACK_MB,
-                 label=f"track {index + 1}")
+    def _desc(track: dict, index: int) -> dict:
         try:
             position = int(track.get("position") or index + 1)
         except (TypeError, ValueError):
             position = index + 1
-        t_title = (track.get("title") or f"track {position}").strip()
-        stem = _sanitize(f"{position:02d}. {t_title}")
+        return {"position": position,
+                "title": (track.get("title") or f"track {position}").strip()}
+
+    def _one(index: int, track: dict) -> None:
+        """one track end-to-end. anything it raises gets one retry, then a
+        skip + a report entry - a single bad track never kills the album."""
+        nonlocal lyrics_found
+        stage("download", index, len(tracks), f"{index + 1}/{len(tracks)}")
+        raw = work / f"{index:02d}.flac"
+        fetch_to(str(track.get("url") or ""), raw, max_mb=MAX_TRACK_MB,
+                 label=f"track {index + 1}")
+        info = _desc(track, index)
+        t_title = info["title"] or f"track {info['position']}"
+        stem = _sanitize(f"{info['position']:02d}. {t_title}")
 
         lyrics: dict = {"found": False}
         if lyrics_cfg.get("mode") != "off":
@@ -394,40 +403,60 @@ def _mono_album(job: dict, hub, work: Path, stage: Stage) -> dict:
 
         if codec is None:
             dest = out_dir / f"{stem}.flac"
+            dest.unlink(missing_ok=True)
             raw.rename(dest)
         else:
             stage("convert", index, len(tracks), f"{index + 1}/{len(tracks)}")
             dest = out_dir / f"{stem}.{ext}"
             run_ffmpeg(["-i", str(raw), *codec, str(dest)])
             raw.unlink(missing_ok=True)
-        tag_file(dest, {"title": t_title, "artists": track.get("artists") or artists,
-                        "album": title, "year": meta.get("year"), "position": position},
-                 cover, _embed_text(lyrics) if lyrics_cfg.get("mode") == "embed" else None)
+        tag_file(dest, {"title": t_title,
+                        "artists": track.get("artists") or artists,
+                        "album": title, "year": meta.get("year"),
+                        "position": info["position"]},
+                 cover, _embed_text(lyrics) if lyrics_cfg.get("mode") == "embed"
+                 else None)
         if lyrics_cfg.get("mode") == "sidecar":
             text, sc_ext = sidecar_text(lyrics.get("synced"), lyrics.get("plain"),
                                         lyrics_cfg.get("prefer") or "synced")
             if text:
                 (out_dir / f"{stem}.{sc_ext}").write_text(text, encoding="utf-8")
 
-        grown = sum(f.stat().st_size for f in out_dir.iterdir())
-        if grown > MAX_ALBUM_MB * 1024 * 1024:
-            raise JobError(f"album passed {MAX_ALBUM_MB} mb on disk. stopped at "
-                           f"track {index + 1}/{len(tracks)} - try a lower quality")
+    failed: list[dict] = []
+    ok = 0
+    pending = list(enumerate(tracks))
+    for attempt in (1, 2):              # v4: one extra pass over the failures
+        still: list[tuple[int, dict]] = []
+        for index, track in pending:
+            try:
+                _one(index, track)
+                ok += 1
+            except Exception as exc:    # noqa: BLE001 - skip, don't die
+                if attempt == 2:
+                    reason = str(exc) if isinstance(exc, JobError) \
+                        else f"runner error: {type(exc).__name__}"
+                    failed.append({**_desc(track, index), "error": reason[:160]})
+                    print(f"track {index + 1} failed twice - skipped")
+                else:
+                    still.append((index, track))
+            grown = sum(f.stat().st_size for f in out_dir.rglob("*")
+                        if f.is_file())
+            if grown > MAX_ALBUM_MB * 1024 * 1024:
+                raise JobError(f"album passed {MAX_ALBUM_MB} mb on disk - "
+                               f"stopped after track {index + 1}/{len(tracks)} "
+                               "- try a lower quality")
+        pending = still
+        if not pending:
+            break
+        stage("download", 0, len(tracks), f"retrying {len(pending)}")
+    if ok == 0:
+        raise JobError(f"all {len(tracks)} tracks failed - mono might be down "
+                       "or the release is unreachable")
 
-    stage("zip", len(tracks), len(tracks), f"{len(tracks)} files")
-    zip_name = _sanitize(f"{', '.join(artists)} - {title}") or "album"
-    zip_path = work / f"{zip_name}.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
-        for item in sorted((work / "album").rglob("*")):
-            if item.is_file():
-                zf.write(item, item.relative_to(work / "album"))
-
-    stage("upload", len(tracks), len(tracks), "zip")
-    url, host = upload_file(zip_path)
-    return {
-        "kind": "album", "url": url, "host": host,
-        "filename": zip_path.name, "quality": quality,
-        "size": zip_path.stat().st_size,
+    items = sorted((f for f in out_dir.rglob("*") if f.is_file()),
+                   key=lambda f: f.name)
+    result = {
+        "kind": "album", "quality": quality,
         "release_id": p.get("release_id"), "title": title, "artists": artists,
         "artwork": meta.get("artwork"), "year": meta.get("year"),
         "type": meta.get("type"), "track_count": len(tracks),
@@ -436,7 +465,66 @@ def _mono_album(job: dict, hub, work: Path, stage: Stage) -> dict:
                     "artists": t.get("artists"), "duration": t.get("duration")}
                    for t in tracks],
     }
+    if failed:
+        result["failed"] = failed       # the cog alerts on these
 
+    if zip_wanted or len(items) > LOOSE_FILES_CAP:
+        if not zip_wanted:
+            result["zip_fallback"] = (f"{len(items)} files is over the loose "
+                                      f"cap ({LOOSE_FILES_CAP}) - zipped instead")
+        stage("zip", ok, len(tracks), f"{len(items)} files")
+        zip_name = _sanitize(f"{', '.join(artists)} - {title}") or "album"
+        zip_path = work / f"{zip_name}.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for item in items:
+                zf.write(item, item.relative_to(out_dir.parent))
+        stage("upload", ok, len(tracks), "zip")
+        url, host = upload_file(zip_path)
+        result.update({
+            "zip": True, "url": url, "host": host,
+            "filename": zip_path.name, "size": zip_path.stat().st_size,
+        })
+        return result
+
+    # loose mode: sidecars upload first (they're small) so the music lines
+    # can link them; then every file on its own. one upload failing skips
+    # that file into `failed`, not the whole job.
+    sidecar_urls: dict[str, str] = {}
+    stage("upload", 0, len(items), f"{len(items)} files")
+    for item in items:
+        if item.suffix.lower() in (".lrc", ".txt"):
+            try:
+                surl, _ = upload_file(item)
+                sidecar_urls[item.stem] = surl
+            except Exception:  # noqa: BLE001
+                pass
+    files: list[dict] = []
+    for i, item in enumerate(items):
+        if item.suffix.lower() in (".lrc", ".txt"):
+            continue
+        stage("upload", i, len(items), f"{i + 1}/{len(items)}")
+        try:
+            furl, fhost = upload_file(item)
+        except Exception as exc:  # noqa: BLE001 - skip, don't die
+            try:
+                upos = int(item.stem.split(".", 1)[0])
+            except ValueError:
+                upos = 0
+            failed.append({"position": upos, "title": item.stem,
+                           "error": f"upload failed: {type(exc).__name__}"})
+            result["failed"] = failed
+            continue
+        entry = {"name": item.name, "url": furl, "host": fhost,
+                 "size": item.stat().st_size}
+        if item.stem in sidecar_urls:
+            entry["lyrics_url"] = sidecar_urls[item.stem]
+        files.append(entry)
+    if not files:
+        raise JobError("every file upload failed - the store chain is down")
+    result.update({"zip": False, "files": files,
+                   "url": None, "host": None, "filename": None,
+                   "size": sum(f["size"] for f in files)})
+    return result
 
 # ------------------------------------------------------------ ffmpeg job
 

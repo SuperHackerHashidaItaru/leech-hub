@@ -55,6 +55,7 @@ import os
 import re
 import secrets
 import time
+import random
 import unicodedata
 from difflib import SequenceMatcher
 from typing import Any, Optional
@@ -291,26 +292,59 @@ async def mono_release(release_id: str) -> dict:
 
 
 # ---------------------------------------------------- upstream: lrclib
+def _retry_after_seconds(raw: Optional[str]) -> Optional[float]:
+    """Retry-After as delay-seconds (lrclib's form). http-dates/junk -> None."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        return None
+
 
 async def _lrclib_get(path: str, params: dict) -> Any:
-    """one GET against lrclib. 200 → json, 404 → None. tests monkeypatch this."""
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                LRCLIB_BASE + path, params=params,
-                headers={"User-Agent": LRCLIB_UA},
-            )
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"lrclib unreachable: {type(exc).__name__}")
-    if resp.status_code == 404:
-        return None
-    if resp.status_code != 200:
-        raise HTTPException(502, f"lrclib answered {resp.status_code}")
-    try:
-        return resp.json()
-    except ValueError:
-        raise HTTPException(502, "lrclib returned non-json")
+    """one lrclib GET, Retry-After aware.
 
+    their docs: 429 (RateLimitExceeded) and 503 (ServerOverloaded - "retry
+    after the Retry-After header, usually 1 second") both carry Retry-After,
+    clients MUST honor it with a little jitter, and under floods the edge
+    may answer non-json - so the status code + header decide, never the
+    body. 200 -> json, 404 -> None (a real miss), still busy after the
+    retries -> clean 503. waits cap at 5s so one lyrics call can't eat
+    the whole function budget.
+    """
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    LRCLIB_BASE + path, params=params,
+                    headers={"User-Agent": LRCLIB_UA},
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"lrclib unreachable: {type(exc).__name__}")
+        if resp.status_code == 404:
+            return None
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError:
+                raise HTTPException(502, "lrclib returned non-json")
+        busy = resp.status_code in (429, 503) or 500 <= resp.status_code < 600
+        if busy and attempt < attempts:
+            wait = _retry_after_seconds(resp.headers.get("Retry-After"))
+            if wait is None:
+                wait = 1.0 * attempt          # no header: gentle backoff
+            wait = min(wait, 5.0)
+            await asyncio.sleep(wait + random.uniform(0.0, wait * 0.3))
+            continue
+        if resp.status_code in (429, 503):
+            raise HTTPException(
+                503, "lrclib is busy (rate limited / overloaded) - "
+                     "try again in a bit")
+        raise HTTPException(502, f"lrclib answered {resp.status_code}")
+    raise HTTPException(502, "lrclib unreachable after retries")
 
 def _norm_text(value: str) -> str:
     """lowercase, fold accents, drop (feat/live/remix) parens + punctuation."""
@@ -576,7 +610,7 @@ class MonoSubmit(BaseModel):
     quality: str = "flac"
     meta: dict = {}
     lyrics: Optional[dict] = None
-
+    zip: bool = True          # v4: False = loose files instead of an album zip
 
 class ConvertSubmit(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -723,6 +757,7 @@ async def api_mono_album(body: MonoSubmit, _=Depends(_authorized)):
     payload = {
         "release_id": rid, "quality": quality, "meta": meta,
         "lyrics": _lyrics_cfg(body.lyrics), "tracks": tracks,
+        "zip": body.zip,          # v4: False = loose files (needs runner v4)
     }
     job = await _submit("mono_album", payload)
     return {"ok": True, "job": job["id"]}
