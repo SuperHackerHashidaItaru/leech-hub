@@ -848,9 +848,24 @@ async def api_jobs_create(body: JobIn, _=Depends(_authorized)):
                 raise HTTPException(400, "clip end must be after start")
         else:
             start = end = None
+
+        cookies = payload.get("cookies")
+        if cookies is not None:
+            cookies = str(cookies).replace("\r\n", "\n").replace("\r", "\n").strip()
+            if not cookies:
+                cookies = None
+            elif len(cookies) > 200_000:
+                raise HTTPException(400, "cookies.txt too big (200kb cap)")
+            elif not any(
+                (not line.strip().startswith("#")) and line.count("\t") >= 6
+                for line in cookies.splitlines() if line.strip()
+            ):
+                raise HTTPException(
+                    400, "that doesn't look like a netscape cookies.txt")
         payload = {
             "url": url, "audio": audio, "quality": quality,
             "max_mb": max_mb, "start": start, "end": end,
+            "cookies": cookies,
         }
     job = await _submit(kind, payload)
     return {"ok": True, "job": job["id"]}

@@ -11,7 +11,7 @@ repo. error text that leaves for the hub is scrubbed by runner.py.
 """
 
 from __future__ import annotations
-
+import os
 import json
 import re
 import shutil
@@ -322,7 +322,7 @@ def _mono_track(job: dict, hub, work: Path, stage: Stage) -> dict:
              cover, _embed_text(lyrics) if lyrics_cfg.get("mode") == "embed" else None)
 
     stage("upload", 2, 3, "")
-    url, host = upload_file(out)
+    url, host = upload_file(str(out))
     result = {
         "kind": "track", "url": url, "host": host,
         "filename": out.name, "format": ext, "quality": quality,
@@ -567,6 +567,7 @@ def _process_ffmpeg(job: dict, hub, work: Path, stage: Stage) -> dict:
 
 
 # ------------------------------------------------------------ yt job
+
 def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
     try:
         import yt_dlp
@@ -582,12 +583,33 @@ def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
     start, end = p.get("start"), p.get("end")
     clip = isinstance(start, (int, float)) and isinstance(end, (int, float)) and float(end) > float(start)
 
+    # v3: per-job cookies from the payload (sent by >ytdlp cookies). the
+    # work dir is wiped after the job, so nothing lingers on disk.
+    cookie_path = None
+    raw_cookies = p.get("cookies")
+    if isinstance(raw_cookies, str) and raw_cookies.strip():
+        cookie_path = work / "cookies.txt"
+        cookie_path.write_text(raw_cookies if raw_cookies.endswith("\n")
+                               else raw_cookies + "\n", encoding="utf-8")
+
+    def _blocked(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(mark in text for mark in (
+            "sign in to confirm", "not a bot", "confirm you're not",
+            "confirm your age", "age-restricted", "login required"))
+
     stage("probe", 0, 4, "")
+    probe_opts: dict = {"quiet": True, "no_warnings": True,
+                        "noplaylist": True, "skip_download": True}
+    if cookie_path:
+        probe_opts["cookiefile"] = str(cookie_path)
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
-                               "noplaylist": True, "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception:
+    except Exception as exc:
+        if _blocked(exc):
+            raise JobError("youtube wants a login on this runner's ip "
+                           "(bot check) - upload cookies with >ytdlp cookies")
         raise JobError("yt-dlp couldn't read that link (private, dead, or unsupported)")
     duration = int(info.get("duration") or 0)
     if duration > 4 * 3600:
@@ -615,6 +637,8 @@ def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
         "progress_hooks": [hook],
         "max_filesize": int(max_mb * 1024 * 1024),
     }
+    if cookie_path:
+        opts["cookiefile"] = str(cookie_path)
     if clip:
         # yt-dlp downloads only the slice (needs a reencode-friendly cut,
         # hence force_keyframes_at_cuts so the boundaries actually land)
@@ -630,8 +654,17 @@ def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
     else:
         opts["format"] = f"bv*[height<={quality}]+ba/b[height<={quality}]"
         opts["merge_output_format"] = "mp4"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except JobError:
+        raise
+    except Exception as exc:
+        if _blocked(exc):
+            raise JobError("youtube wants a login on this runner's ip "
+                           "(bot check) - upload cookies with >ytdlp cookies")
+        raise JobError("yt-dlp couldn't download that link (over the size "
+                       "cap, private, or unsupported)")
     files = [f for f in work.iterdir() if f.name.startswith("src.")]
     if not files:
         raise JobError("yt-dlp produced nothing (over the size cap, private, or unsupported)")
@@ -654,7 +687,7 @@ def _process_yt(job: dict, hub, work: Path, stage: Stage) -> dict:
         final = shrunk
 
     stage("upload", 3, 4, "")
-    cdn, host = upload_file(final)
+    cdn, host = upload_file(str(final))
     return {
         "kind": "yt", "url": cdn, "host": host, "filename": final.name,
         "format": final.suffix.lstrip(".") or ("mp3" if audio else "mp4"),
