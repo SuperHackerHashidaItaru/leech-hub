@@ -1,12 +1,5 @@
 name: leech-runner
 
-# the compute leg of the leech hub. this repo is PUBLIC on purpose:
-# standard github-hosted runners are FREE with no minute cap on public
-# repos (4 vCPU / 16GB ubuntu), while a private repo would burn the
-# 2000 free minutes fast. the code carries no secrets - hub url + token
-# live in repo secrets, and runner.py only ever prints job ids, sizes
-# and stages to these (public) logs - never urls, tokens or filenames.
-
 on:
   repository_dispatch:            # the hub fires this on every job submit
     types: [leech-job]

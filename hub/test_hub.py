@@ -372,10 +372,17 @@ def test_internal_error_never_leaks_traceback(state, client):
 
 
 def test_yt_job_via_generic_lane(state, client):
+    # v10: the generic lane speaks the v3 runner contract (url/audio/
+    # quality/max_mb/start/end/cookies) - the v2 audio_only/format/bitrate
+    # keys were dropped when PATCH B rewrote the yt lane.
     r = client.post("/api/jobs", json={
         "kind": "yt",
         "payload": {"url": "https://youtube.com/watch?v=abc",
-                    "audio_only": True, "format": "mp3", "bitrate": 192},
+                    "audio": True, "quality": 720, "max_mb": 500,
+                    "start": 1, "end": 10,
+                    "cookies": "# netscape dump\r\n"
+                               ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t"
+                               "NAME\tVAL\r\n"},
     }, headers=HEADERS)
     assert r.status_code == 200
     job_id = r.json()["job"]
@@ -383,7 +390,13 @@ def test_yt_job_via_generic_lane(state, client):
                       headers=HEADERS).json()["job"]
     assert job["kind"] == "yt"
     assert job["payload"]["url"].startswith("https://youtube.com/")
-    assert job["payload"]["format"] == "mp3"
+    assert job["payload"]["audio"] is True
+    assert job["payload"]["quality"] == 720
+    assert job["payload"]["max_mb"] == 500.0
+    assert job["payload"]["start"] == 1.0 and job["payload"]["end"] == 10.0
+    # cookies ride through, CRLF-normalized (PATCH H behavior)
+    assert "\r\n" not in (job["payload"]["cookies"] or "")
+    assert "\tNAME\tVAL" in job["payload"]["cookies"]
 
 
 def test_unknown_kind_rejected(state, client):

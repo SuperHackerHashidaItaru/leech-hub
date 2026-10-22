@@ -1,0 +1,34 @@
+name: ci
+
+# NOTE: this repo is PUBLIC (free unlimited minutes).  fork PRs run the
+# tests with a read-only token and no secrets - never switch this to
+# pull_request_target or secrets leak to fork authors.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          pip install -r hub/requirements.txt -r requirements.txt pytest
+      - name: compile
+        run: python -m compileall -q hub runner.py hub_client.py processors.py tagging.py uploaders.py
+      - name: pytest
+        run: python -m pytest hub/test_hub.py test_runner.py

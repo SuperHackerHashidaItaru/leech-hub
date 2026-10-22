@@ -75,6 +75,12 @@ UPSTASH_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip().rstrip("/
 UPSTASH_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 MONO_BASE = (os.environ.get("MONO_BASE") or "https://tracks.monochrome.st").strip().rstrip("/")
 LRCLIB_BASE = (os.environ.get("LRCLIB_BASE") or "https://lrclib.net").strip().rstrip("/")
+
+# v10: fuzzy gates for the lyrics search fallback - loose enough for
+# remasters/live suffixes, tight enough that a lookalike from another
+# artist never rides the auto-attach path (tests pin both sides).
+FUZZY_ARTIST_MIN = 0.70
+FUZZY_TRACK_MIN = 0.60
 GITHUB_API = (os.environ.get("GITHUB_API") or "https://api.github.com").strip().rstrip("/")
 GITHUB_REPO = (os.environ.get("GITHUB_REPO") or "").strip().strip("/")
 GITHUB_PAT = (os.environ.get("GITHUB_PAT") or "").strip()
@@ -437,15 +443,30 @@ async def lyrics_get(artist: str, track: str, album: Optional[str] = None,
         if isinstance(exact, dict):
             best = _lyrics_record(exact)
         if best is None:
-            # v3: no validation - first search hit wins, the user picks
-            # with index= on the cog side. exact /api/get above already
-            # returned "the" match for these fields when lrclib has one.
+            # v10: search fallback with fuzzy gating.  the exact /api/get
+            # above already handles the precise case; here only candidates
+            # close enough on BOTH artist and track are accepted, so a
+            # lookalike never sneaks into the auto-attach path (the cog's
+            # manual search flow is unaffected - it lists everything and
+            # the user picks with index=).
             results = await _lrclib_get("/api/search", {
                 "artist_name": artist, "track_name": track,
             })
-            candidates = [x for x in (results or []) if isinstance(x, dict)]
-            if candidates:
-                best = _lyrics_record(candidates[0])
+            saw_candidates = False
+            for cand in (results or []):
+                if not isinstance(cand, dict):
+                    continue
+                saw_candidates = True
+                if (_ratio(str(cand.get("artistName") or ""), artist)
+                        >= FUZZY_ARTIST_MIN
+                        and _ratio(str(cand.get("trackName") or ""), track)
+                        >= FUZZY_TRACK_MIN):
+                    best = _lyrics_record(cand)
+                    break
+            if best is None and saw_candidates:
+                return {"found": False, "prefer": prefer, "reason":
+                        "lrclib search only had lookalikes "
+                        "(artist/track too far off)"}
         if best is None:
             return {"found": False, "reason": "lrclib has nothing for that "
                     "artist/track", "prefer": prefer}
